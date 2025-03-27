@@ -21,7 +21,7 @@ def get_display_size():
     try:
         screen = screeninfo.get_monitors()[0]
         return screen.width, screen.height
-    except:
+    except Exception as e:
         return 640, 480
 
 def calculate_distance(landmarks, width, height, focal_length):
@@ -89,7 +89,6 @@ def get_head_orientation(landmarks, width, height, camera_matrix, dist_coeffs, a
             yaw -= initial_offset[1]
             roll -= initial_offset[2]
 
-        # Stabilize quaternion to prevent flipping
         quat = Rotation.from_matrix(rmat).as_quat()
         quat_history.append(quat)
         if len(quat_history) > 10:
@@ -102,51 +101,42 @@ def get_head_orientation(landmarks, width, height, camera_matrix, dist_coeffs, a
         return pitch, yaw, roll, smoothed_rmat, tvec
     return 0.0, 0.0, 0.0, np.eye(3), np.zeros((3, 1))
 
-def calculate_gaze_projection(landmarks, width, height, distance_cm, head_pitch, head_yaw, head_rmat, head_tvec, gaze_history, mirror_mode=True):
+def calculate_gaze_projection(landmarks, width, height, distance_cm, head_pitch, head_yaw, head_rmat, head_tvec, gaze_history, mirror_mode=True, pitch_offset=None, gaze_offset=None):
+    # Compute eye centers
     left_eye_center = np.mean([(landmarks[33].x * width, landmarks[33].y * height),
                                (landmarks[133].x * width, landmarks[133].y * height)], axis=0)
     right_eye_center = np.mean([(landmarks[263].x * width, landmarks[263].y * height),
                                 (landmarks[362].x * width, landmarks[362].y * height)], axis=0)
     eye_center_2d = (left_eye_center + right_eye_center) / 2
 
-    # Eye position in 3D relative to head
-    eye_offset = np.array([0, -50, -50])  # Approx eye position relative to nose tip (mm)
-    eye_pos = head_tvec.flatten() + np.dot(head_rmat, eye_offset)
-
+    # Compute iris centers
     left_iris_center = np.mean([(landmarks[i].x * width, landmarks[i].y * height) for i in [468, 469, 470, 471]], axis=0)
     right_iris_center = np.mean([(landmarks[i].x * width, landmarks[i].y * height) for i in [473, 474, 475, 476]], axis=0)
     iris_center_2d = (left_iris_center + right_iris_center) / 2
 
-    # Eye angles with increased sensitivity
     eye_width = np.linalg.norm(right_eye_center - left_eye_center) / 2
     gaze_vec_2d = iris_center_2d - eye_center_2d
-    eye_yaw = math.degrees(math.atan2(gaze_vec_2d[0], eye_width)) * 2  # Boosted sensitivity
-    eye_pitch = math.degrees(math.atan2(gaze_vec_2d[1], eye_width)) * 2
 
-    if mirror_mode:
-        head_yaw = -head_yaw
-        head_pitch = -head_pitch
-        eye_yaw = -eye_yaw
+    # Compute gaze angles (in degrees) with a multiplier for sensitivity
+    eye_yaw = math.degrees(math.atan2(gaze_vec_2d[0], eye_width)) * 1.5
+    eye_pitch = math.degrees(math.atan2(gaze_vec_2d[1], eye_width)) * 1.5
 
-    total_yaw = head_yaw + eye_yaw
-    total_pitch = head_pitch + eye_pitch
+    if pitch_offset is not None:
+        eye_pitch -= pitch_offset
 
-    # Gaze direction in head space
-    gaze_dir_head = np.array([
-        math.sin(math.radians(eye_yaw)) * math.cos(math.radians(eye_pitch)),
-        math.sin(math.radians(eye_pitch)),
-        math.cos(math.radians(eye_yaw)) * math.cos(math.radians(eye_pitch))
-    ])
-    # Transform to world space using head rotation
-    gaze_dir = np.dot(head_rmat, gaze_dir_head)
+    # Adjust scaling: use a lower "gaze_range" to increase sensitivity.
+    gaze_range = 15.0  # degrees corresponding to half-screen displacement
+    yaw_scale = (width / 2) / gaze_range
+    pitch_scale = (height / 2) / gaze_range
 
-    # Project from eye position to screen plane (z = 0)
-    t = -eye_pos[2] / gaze_dir[2]
-    gaze_point_3d = eye_pos + t * gaze_dir
+    gaze_x = (eye_yaw * yaw_scale) + width / 2
+    gaze_y = (eye_pitch * pitch_scale) + height / 2
 
-    focal_length = width
-    gaze_x = (gaze_point_3d[0] * focal_length / -eye_pos[2]) + width / 2
-    gaze_y = (gaze_point_3d[1] * focal_length / -eye_pos[2]) + height / 2
+    if gaze_offset is not None:
+        gaze_x -= gaze_offset[0]
+        gaze_y -= gaze_offset[1]
+
+    print(f"Eye Yaw: {eye_yaw:.1f}, Eye Pitch: {eye_pitch:.1f}, Gaze X: {gaze_x:.1f}, Gaze Y: {gaze_y:.1f}")
 
     gaze_history.append([gaze_x, gaze_y])
     if len(gaze_history) > 5:
@@ -262,6 +252,31 @@ def refine_landmarks(prev_frame_gray, curr_frame_gray, landmarks, landmark_histo
     smoothed_points = np.average(np.array(landmark_history), axis=0, weights=weights[-len(landmark_history):])
     return smoothed_points
 
+def calibration_wizard(frame, phase, instruction, timer, total_time):
+    """
+    Draws a semi-transparent overlay with calibration instructions.
+    """
+    overlay = frame.copy()
+    alpha = 0.6  # transparency factor
+    cv2.rectangle(overlay, (0, 0), (frame.shape[1], 80), (50, 50, 50), -1)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+    instruction_text = f"{phase}: {instruction}"
+    countdown_text = f"Hold steady for: {timer:.1f}s"
+
+    cv2.putText(frame, instruction_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    cv2.putText(frame, countdown_text, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    progress = int((total_time - timer) / total_time * frame.shape[1])
+    cv2.rectangle(frame, (0, 75), (progress, 80), (0, 255, 0), -1)
+
+    # For Gaze Calibration, display a RED dot target at the center.
+    if "Gaze" in phase:
+        target = (frame.shape[1]//2, frame.shape[0]//2)
+        cv2.circle(frame, target, 8, (0, 0, 255), -1)
+
+    return frame
+
 def apply_anime_filter(frame, landmarks, face_landmarks, hand_landmarks_list, frame_count, prev_frame_gray, curr_frame_gray, face_history, hand_histories, show_lasers=True, show_video=True, show_overlay=False, distance_cm=None, pitch=None, yaw=None, roll=None, rmat=None, gaze_point=None, eye_yaw=None, eye_pitch=None):
     width, height = frame.shape[1], frame.shape[0]
     if not show_video and not show_overlay:
@@ -274,7 +289,7 @@ def apply_anime_filter(frame, landmarks, face_landmarks, hand_landmarks_list, fr
 
         if not show_overlay:
             for x, y in refined_face_landmarks:
-                cv2.circle(frame, (int(x), int(y)), 1, (255, 255, 255), -1)
+                cv2.circle(frame, (int(x), int(y)), 1, (255, 255, 0), -1)
             for connection in mp_face_mesh.FACEMESH_TESSELATION:
                 idx1, idx2 = connection
                 x1, y1 = map(int, refined_face_landmarks[idx1])
@@ -282,8 +297,9 @@ def apply_anime_filter(frame, landmarks, face_landmarks, hand_landmarks_list, fr
                 cv2.line(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
 
         if gaze_point and show_video:
-            cv2.circle(frame, gaze_point, 10, (0, 255, 0), 2)
-            cv2.putText(frame, "Gaze", (gaze_point[0] + 15, gaze_point[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            # Draw a red dot at the gaze point for feedback.
+            cv2.circle(frame, gaze_point, 10, (0, 0, 255), 2)
+            cv2.putText(frame, "Gaze", (gaze_point[0] + 15, gaze_point[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
         if show_overlay and landmarks is not None:
             nose_tip = (int(landmarks[1].x * width), int(landmarks[1].y * height))
@@ -303,11 +319,11 @@ def apply_anime_filter(frame, landmarks, face_landmarks, hand_landmarks_list, fr
                                int(np.mean([landmarks[i].y * height for i in [33, 133]])))
             right_eye_center = (int(np.mean([landmarks[i].x * width for i in [263, 362]])),
                                 int(np.mean([landmarks[i].y * height for i in [263, 362]])))
-            eye_length = 150  # Increased for visibility
+            eye_length = 150
             left_eye_end = (int(left_eye_center[0] + eye_length * math.sin(math.radians(eye_yaw))),
-                            int(left_eye_center[1] + eye_length * math.sin(math.radians(eye_pitch))))
+                            int(left_eye_center[1] - eye_length * math.sin(math.radians(eye_pitch))))
             right_eye_end = (int(right_eye_center[0] + eye_length * math.sin(math.radians(eye_yaw))),
-                             int(right_eye_center[1] + eye_length * math.sin(math.radians(eye_pitch))))
+                             int(right_eye_center[1] - eye_length * math.sin(math.radians(eye_pitch))))
             cv2.line(frame, left_eye_center, left_eye_end, (255, 255, 0), 2)
             cv2.line(frame, right_eye_center, right_eye_end, (255, 255, 0), 2)
 
@@ -364,7 +380,7 @@ def apply_mask():
     show_lasers = True
     show_video = True
     show_overlay = False
-    print("Video is mirrored. Press 'm' (mirror), 'l' (lasers), 'v' (video), 'a' (overlay), 'c' (calibrate), 'q' (quit).")
+    print("Video is mirrored. Press 'm' (mirror), 'l' (lasers), 'v' (video), 'a' (overlay), 'c' (calibration wizard), 'q' (quit).")
 
     frame_count = 0
     prev_frame_gray = None
@@ -375,7 +391,39 @@ def apply_mask():
     gaze_history = deque(maxlen=5)
     camera_matrix = np.array([[focal_length, 0, width/2], [0, focal_length, height/2], [0, 0, 1]], dtype="double")
     dist_coeffs = np.zeros((4, 1))
+
+    # Calibration offsets (default: not calibrated)
     initial_offset = None
+    pitch_offset = None
+    gaze_offset = None
+
+    # Calibration wizard variables
+    calibration_mode = False
+    calibration_step_index = 0
+    calibration_timer_start = 0
+    # Store calibration values in a dict for easy updating
+    calibration_values = {"initial_offset": None, "gaze_offset": None, "pitch_offset": None}
+    # Define calibration steps with instructions and durations (in seconds)
+    calibration_steps = [
+        {
+            "phase": "Head Calibration",
+            "instruction": "Center your FACE and look straight into the camera.",
+            "duration": 3.0,
+            "action": lambda pitch, yaw, roll, gaze_pt, eye_pitch: calibration_values.update({"initial_offset": [pitch, yaw, roll]})
+        },
+        {
+            "phase": "Gaze Calibration",
+            "instruction": "FIX your GAZE on the RED dot at the center of the screen.",
+            "duration": 3.0,
+            "action": lambda pitch, yaw, roll, gaze_pt, eye_pitch: calibration_values.update({"gaze_offset": [gaze_pt[0] - width/2, gaze_pt[1] - height/2]})
+        },
+        {
+            "phase": "Eye Pitch Calibration",
+            "instruction": "Keep your eyes LEVEL and look straight ahead.",
+            "duration": 3.0,
+            "action": lambda pitch, yaw, roll, gaze_pt, eye_pitch: calibration_values.update({"pitch_offset": eye_pitch})
+        }
+    ]
 
     while True:
         ret, frame = cap.read()
@@ -409,7 +457,38 @@ def apply_mask():
             landmarks = face_landmarks.landmark
             distance_cm = calculate_distance(landmarks, width, height, focal_length)
             pitch, yaw, roll, rmat, tvec = get_head_orientation(landmarks, width, height, camera_matrix, dist_coeffs, angle_history, quat_history, initial_offset)
-            (gaze_point, eye_yaw, eye_pitch) = calculate_gaze_projection(landmarks, width, height, distance_cm, pitch, yaw, rmat, tvec, gaze_history, mirror_mode)
+            (gaze_point, eye_yaw, eye_pitch) = calculate_gaze_projection(landmarks, width, height, distance_cm, pitch, yaw, rmat, tvec, gaze_history, mirror_mode, pitch_offset, gaze_offset)
+
+        # --- Calibration Wizard Mode ---
+        if calibration_mode:
+            if face_landmarks:
+                current_step = calibration_steps[calibration_step_index]
+                current_time = time.time()
+                time_elapsed = current_time - calibration_timer_start
+                time_left = current_step["duration"] - time_elapsed
+                # Overlay the calibration wizard instructions (includes RED dot for gaze calibration)
+                frame = calibration_wizard(frame, current_step["phase"], current_step["instruction"], time_left, current_step["duration"])
+                if time_left <= 0:
+                    # Capture calibration values using current measurements
+                    if pitch is not None and yaw is not None and roll is not None and gaze_point is not None and eye_pitch is not None:
+                        current_step["action"](pitch, yaw, roll, gaze_point, eye_pitch)
+                        print(f"{current_step['phase']} done. Values captured.")
+                    else:
+                        print("No valid face data for calibration. Try again.")
+                    calibration_step_index += 1
+                    if calibration_step_index >= len(calibration_steps):
+                        # Apply calibration values
+                        initial_offset = calibration_values["initial_offset"]
+                        gaze_offset = calibration_values["gaze_offset"]
+                        pitch_offset = calibration_values["pitch_offset"]
+                        calibration_mode = False
+                        print("Calibration COMPLETE! Your settings have been updated.")
+                    else:
+                        calibration_timer_start = time.time()
+            else:
+                cv2.putText(frame, "No face detected. Align your face in the frame.", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+        # --- End Calibration Wizard Mode ---
 
         frame = apply_anime_filter(frame, landmarks, face_landmarks, hand_landmarks_list, frame_count, prev_frame_gray, curr_frame_gray, face_history, hand_histories, show_lasers, show_video, show_overlay, distance_cm, pitch, yaw, roll, rmat, gaze_point, eye_yaw, eye_pitch)
 
@@ -420,12 +499,17 @@ def apply_mask():
         video_text = "Video: ON" if show_video else "Video: OFF"
         overlay_text = "Overlay: ON" if show_overlay else "Overlay: OFF"
         calib_text = "Calibrated" if initial_offset is not None else "Not Calibrated"
+        pitch_calib_text = "Pitch Calibrated" if pitch_offset is not None else "Pitch Not Calibrated"
+        gaze_calib_text = "Gaze Calibrated" if gaze_offset is not None else "Gaze Not Calibrated"
         cv2.putText(frame, mirror_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, laser_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, video_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, overlay_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, calib_text, (10, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, "Press 'm' (mirror) | 'l' (lasers) | 'v' (video) | 'a' (overlay) | 'c' (calibrate) | 'q' (quit)", (10, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(frame, pitch_calib_text, (10, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, gaze_calib_text, (10, 390), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        instructions = "Press 'm' (mirror) | 'l' (lasers) | 'v' (video) | 'a' (overlay) | 'c' (calibration wizard) | 'q' (quit)"
+        cv2.putText(frame, instructions, (10, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
         cv2.imshow("Bitcoin Laser Eyes with Gaze Tracking", frame)
 
@@ -444,9 +528,15 @@ def apply_mask():
         elif key == ord('a'):
             show_overlay = not show_overlay
             print(f"Overlay: {'ON' if show_overlay else 'OFF'}")
-        elif key == ord('c') and pitch is not None:
-            initial_offset = [pitch, yaw, roll]
-            print(f"Calibrated with offset: Pitch={initial_offset[0]:.1f}, Yaw={initial_offset[1]:.1f}, Roll={initial_offset[2]:.1f}")
+        elif key == ord('c'):
+            # Start the unified calibration wizard if not already in calibration mode
+            if not calibration_mode:
+                calibration_mode = True
+                calibration_step_index = 0
+                calibration_timer_start = time.time()
+                calibration_values = {"initial_offset": None, "gaze_offset": None, "pitch_offset": None}
+                print("Entering Calibration Wizard Mode. Follow the on-screen instructions.")
+        # When calibration_mode is active, ignore individual calibration key presses
 
     cap.release()
     cv2.destroyAllWindows()
