@@ -9,9 +9,18 @@ from scipy.spatial.transform import Rotation
 
 # Initialize MediaPipe Face Mesh and Hand Landmarker
 mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+face_mesh = mp_face_mesh.FaceMesh(
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+hands = mp_hands.Hands(
+    max_num_hands=2,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 mp_drawing = mp.solutions.drawing_utils
 
 # Average human inter-eye distance in mm
@@ -49,7 +58,7 @@ def slerp_quat(q1, q2, t):
 
 def get_head_orientation(landmarks, width, height, camera_matrix, dist_coeffs, angle_history, quat_history, initial_offset=None):
     model_points = np.array([
-        (0.0, 0.0, 0.0),        # Nose tip
+        (0.0, 0.0, 0.0),         # Nose tip
         (-225.0, 170.0, -135.0), # Left eye corner
         (225.0, 170.0, -135.0),  # Right eye corner
         (0.0, -330.0, -65.0),    # Chin
@@ -64,10 +73,13 @@ def get_head_orientation(landmarks, width, height, camera_matrix, dist_coeffs, a
         (landmarks[61].x * width, landmarks[61].y * height),
         (landmarks[291].x * width, landmarks[291].y * height)
     ], dtype="double")
-    success, rvec, tvec = cv2.solvePnP(model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
+
+    success, rvec, tvec = cv2.solvePnP(
+        model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+    )
     if success:
         rmat, _ = cv2.Rodrigues(rvec)
-        sy = math.sqrt(rmat[0, 0] * rmat[0, 0] + rmat[1, 0] * rmat[1, 0])
+        sy = math.sqrt(rmat[0, 0]*rmat[0, 0] + rmat[1, 0]*rmat[1, 0])
         singular = sy < 1e-6
         if not singular:
             pitch = math.degrees(math.atan2(rmat[2, 1], rmat[2, 2]))
@@ -101,94 +113,150 @@ def get_head_orientation(landmarks, width, height, camera_matrix, dist_coeffs, a
         return pitch, yaw, roll, smoothed_rmat, tvec
     return 0.0, 0.0, 0.0, np.eye(3), np.zeros((3, 1))
 
-def calculate_gaze_projection(landmarks, width, height, distance_cm, head_pitch, head_yaw, head_rmat, head_tvec, gaze_history, mirror_mode=True, pitch_offset=None, gaze_offset=None):
-    # Compute eye centers
-    left_eye_center = np.mean([(landmarks[33].x * width, landmarks[33].y * height),
-                               (landmarks[133].x * width, landmarks[133].y * height)], axis=0)
-    right_eye_center = np.mean([(landmarks[263].x * width, landmarks[263].y * height),
-                                (landmarks[362].x * width, landmarks[362].y * height)], axis=0)
+def calculate_gaze_projection(
+    landmarks,
+    width, height,
+    distance_cm,
+    head_pitch, head_yaw, head_rmat, head_tvec,
+    gaze_history,
+    mirror_mode=True,
+    pitch_offset=None,
+    gaze_offset=None,
+    display_w=1920,  # fallback
+    display_h=1080   # fallback
+):
+    """
+    Returns:
+      (screen_x, screen_y) in full display coords,
+      plus eye_yaw, eye_pitch for debugging.
+    """
+
+    # Compute eye centers on the 640x480 camera feed
+    left_eye_center = np.mean([
+        (landmarks[33].x * width,  landmarks[33].y * height),
+        (landmarks[133].x * width, landmarks[133].y * height)
+    ], axis=0)
+    right_eye_center = np.mean([
+        (landmarks[263].x * width, landmarks[263].y * height),
+        (landmarks[362].x * width, landmarks[362].y * height)
+    ], axis=0)
     eye_center_2d = (left_eye_center + right_eye_center) / 2
 
     # Compute iris centers
-    left_iris_center = np.mean([(landmarks[i].x * width, landmarks[i].y * height) for i in [468, 469, 470, 471]], axis=0)
-    right_iris_center = np.mean([(landmarks[i].x * width, landmarks[i].y * height) for i in [473, 474, 475, 476]], axis=0)
+    left_iris_center = np.mean([
+        (landmarks[i].x * width, landmarks[i].y * height)
+        for i in [468, 469, 470, 471]
+    ], axis=0)
+    right_iris_center = np.mean([
+        (landmarks[i].x * width, landmarks[i].y * height)
+        for i in [473, 474, 475, 476]
+    ], axis=0)
     iris_center_2d = (left_iris_center + right_iris_center) / 2
 
     eye_width = np.linalg.norm(right_eye_center - left_eye_center) / 2
     gaze_vec_2d = iris_center_2d - eye_center_2d
 
-    # Compute gaze angles (in degrees) with a multiplier for sensitivity
-    eye_yaw = math.degrees(math.atan2(gaze_vec_2d[0], eye_width)) * 1.5
-    eye_pitch = math.degrees(math.atan2(gaze_vec_2d[1], eye_width)) * 1.5
+    # Compute gaze angles (in degrees) with sensitivity multipliers
+    eye_yaw = math.degrees(math.atan2(gaze_vec_2d[0], eye_width)) * 9
+    eye_pitch = math.degrees(math.atan2(gaze_vec_2d[1], eye_width)) * 9
 
     if pitch_offset is not None:
         eye_pitch -= pitch_offset
 
-    # Adjust scaling: use a lower "gaze_range" to increase sensitivity.
-    gaze_range = 15.0  # degrees corresponding to half-screen displacement
-    yaw_scale = (width / 2) / gaze_range
-    pitch_scale = (height / 2) / gaze_range
+    # We want to map the angles to the FULL display:
+    # If display is e.g. 1920x1080, we define how many degrees correspond to half the display width/height.
+    gaze_range_x = 15.0  # degrees for half-screen displacement horizontally
+    gaze_range_y = 5.0   # degrees for half-screen displacement vertically
 
-    gaze_x = (eye_yaw * yaw_scale) + width / 2
-    gaze_y = (eye_pitch * pitch_scale) + height / 2
+    # Convert angles to display coords
+    yaw_scale = (display_w / 2) / gaze_range_x
+    pitch_scale = (display_h / 2) / gaze_range_y
+
+    # So the center of the display is at (display_w/2, display_h/2)
+    screen_x = (eye_yaw * yaw_scale) + display_w / 2
+    screen_y = (eye_pitch * pitch_scale) + display_h / 2
 
     if gaze_offset is not None:
-        gaze_x -= gaze_offset[0]
-        gaze_y -= gaze_offset[1]
+        screen_x -= gaze_offset[0]
+        screen_y -= gaze_offset[1]
 
-    print(f"Eye Yaw: {eye_yaw:.1f}, Eye Pitch: {eye_pitch:.1f}, Gaze X: {gaze_x:.1f}, Gaze Y: {gaze_y:.1f}")
+    # Let's clamp to the display's boundaries
+    screen_x = max(0, min(screen_x, display_w - 1))
+    screen_y = max(0, min(screen_y, display_h - 1))
 
-    gaze_history.append([gaze_x, gaze_y])
+    # Save to the smoothing queue
+    gaze_history.append([screen_x, screen_y])
     if len(gaze_history) > 5:
         gaze_history.popleft()
     smoothed_gaze = np.mean(gaze_history, axis=0)
-    u = max(0, min(smoothed_gaze[0], width - 1))
-    v = max(0, min(smoothed_gaze[1], height - 1))
+    final_x = int(smoothed_gaze[0])
+    final_y = int(smoothed_gaze[1])
 
-    return (int(u), int(v)), eye_yaw, eye_pitch
+    print(f"Eye Yaw: {eye_yaw:.1f}, Eye Pitch: {eye_pitch:.1f}, "
+          f"Gaze X: {final_x}, Gaze Y: {final_y} (display coords)")
+
+    return (final_x, final_y), eye_yaw, eye_pitch
 
 def create_bitcoin_laser_eyes(landmarks, frame, frame_count, width, height, is_face=True):
     if is_face:
         model_points = np.array([
-            [-100.0, 50.0, -50.0], [100.0, 50.0, -50.0], [0.0, 0.0, 0.0],
-            [0.0, -150.0, -50.0], [-75.0, -75.0, -50.0], [75.0, -75.0, -50.0]
+            [-100.0, 50.0, -50.0],
+            [100.0, 50.0, -50.0],
+            [0.0, 0.0, 0.0],
+            [0.0, -150.0, -50.0],
+            [-75.0, -75.0, -50.0],
+            [75.0, -75.0, -50.0]
         ], dtype="double")
         image_points = np.array([
             (landmarks[33].x * width, landmarks[33].y * height),
             (landmarks[263].x * width, landmarks[263].y * height),
-            (landmarks[1].x * width, landmarks[1].y * height),
+            (landmarks[1].x * width,  landmarks[1].y * height),
             (landmarks[152].x * width, landmarks[152].y * height),
-            (landmarks[61].x * width, landmarks[61].y * height),
+            (landmarks[61].x * width,  landmarks[61].y * height),
             (landmarks[291].x * width, landmarks[291].y * height)
         ], dtype="double")
         left_eye_indices = [33, 246, 161, 160, 159, 158]
         right_eye_indices = [263, 466, 388, 387, 386, 385]
-        left_center = (int(np.mean([landmarks[i].x * width for i in left_eye_indices])),
-                       int(np.mean([landmarks[i].y * height for i in left_eye_indices])))
-        right_center = (int(np.mean([landmarks[i].x * width for i in right_eye_indices])),
-                        int(np.mean([landmarks[i].y * height for i in right_eye_indices])))
+        left_center = (
+            int(np.mean([landmarks[i].x * width for i in left_eye_indices])),
+            int(np.mean([landmarks[i].y * height for i in left_eye_indices]))
+        )
+        right_center = (
+            int(np.mean([landmarks[i].x * width for i in right_eye_indices])),
+            int(np.mean([landmarks[i].y * height for i in right_eye_indices]))
+        )
     else:
         model_points = np.array([
-            [0.0, 0.0, 0.0], [50.0, -50.0, -20.0], [50.0, -100.0, -30.0],
-            [-50.0, -50.0, -20.0], [-50.0, -100.0, -30.0], [0.0, -70.0, -10.0]
+            [0.0, 0.0, 0.0],
+            [50.0, -50.0, -20.0],
+            [50.0, -100.0, -30.0],
+            [-50.0, -50.0, -20.0],
+            [-50.0, -100.0, -30.0],
+            [0.0, -70.0, -10.0]
         ], dtype="double")
         image_points = np.array([
-            (landmarks[0].x * width, landmarks[0].y * height),
-            (landmarks[5].x * width, landmarks[5].y * height),
-            (landmarks[8].x * width, landmarks[8].y * height),
+            (landmarks[0].x * width,  landmarks[0].y * height),
+            (landmarks[5].x * width,  landmarks[5].y * height),
+            (landmarks[8].x * width,  landmarks[8].y * height),
             (landmarks[17].x * width, landmarks[17].y * height),
             (landmarks[20].x * width, landmarks[20].y * height),
-            (landmarks[9].x * width, landmarks[9].y * height)
+            (landmarks[9].x * width,  landmarks[9].y * height)
         ], dtype="double")
         left_center = (int(landmarks[8].x * width), int(landmarks[8].y * height))
         right_center = left_center
 
     focal_length = width
     center = (width / 2, height / 2)
-    camera_matrix = np.array([[focal_length, 0, center[0]], [0, focal_length, center[1]], [0, 0, 1]], dtype="double")
+    camera_matrix = np.array([
+        [focal_length, 0, center[0]],
+        [0, focal_length, center[1]],
+        [0, 0, 1]
+    ], dtype="double")
     dist_coeffs = np.zeros((4, 1))
 
-    success, rotation_vector, translation_vector = cv2.solvePnP(model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
+    success, rotation_vector, translation_vector = cv2.solvePnP(
+        model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+    )
     if not success:
         print(f"Pose estimation failed for {'face' if is_face else 'hand'}")
         return frame
@@ -232,7 +300,10 @@ def create_bitcoin_laser_eyes(landmarks, frame, frame_count, width, height, is_f
     return frame
 
 def refine_landmarks(prev_frame_gray, curr_frame_gray, landmarks, landmark_history, num_landmarks):
-    current_points = np.array([(l.x * curr_frame_gray.shape[1], l.y * curr_frame_gray.shape[0]) for l in landmarks], dtype=np.float32)
+    current_points = np.array([
+        (l.x * curr_frame_gray.shape[1], l.y * curr_frame_gray.shape[0])
+        for l in landmarks
+    ], dtype=np.float32)
     if prev_frame_gray is not None and len(landmark_history) > 0:
         prev_points = np.array(landmark_history[-1], dtype=np.float32).reshape(-1, 1, 2)
         curr_points_flow, status, err = cv2.calcOpticalFlowPyrLK(
@@ -249,7 +320,9 @@ def refine_landmarks(prev_frame_gray, curr_frame_gray, landmarks, landmark_histo
 
     weights = np.linspace(0.5, 1.0, min(len(landmark_history), 5))
     weights /= weights.sum()
-    smoothed_points = np.average(np.array(landmark_history), axis=0, weights=weights[-len(landmark_history):])
+    smoothed_points = np.average(
+        np.array(landmark_history), axis=0, weights=weights[-len(landmark_history):]
+    )
     return smoothed_points
 
 def calibration_wizard(frame, phase, instruction, timer, total_time):
@@ -277,16 +350,48 @@ def calibration_wizard(frame, phase, instruction, timer, total_time):
 
     return frame
 
-def apply_anime_filter(frame, landmarks, face_landmarks, hand_landmarks_list, frame_count, prev_frame_gray, curr_frame_gray, face_history, hand_histories, show_lasers=True, show_video=True, show_overlay=False, distance_cm=None, pitch=None, yaw=None, roll=None, rmat=None, gaze_point=None, eye_yaw=None, eye_pitch=None):
+def apply_anime_filter(
+    frame,
+    landmarks,
+    face_landmarks,
+    hand_landmarks_list,
+    frame_count,
+    prev_frame_gray,
+    curr_frame_gray,
+    face_history,
+    hand_histories,
+    show_lasers=True,
+    show_video=True,
+    show_overlay=False,
+    distance_cm=None,
+    pitch=None,
+    yaw=None,
+    roll=None,
+    rmat=None,
+    gaze_point=None,    # <--- This is now (screen_x, screen_y) in full display coords
+    eye_yaw=None,
+    eye_pitch=None,
+    display_w=1920,     # for scaling the dot
+    display_h=1080
+):
+    """
+    We show the camera feed at 640x480, but 'gaze_point' is in the full display's coordinates.
+    We'll scale it down to the camera feed if we want to see the dot.
+    """
     width, height = frame.shape[1], frame.shape[0]
+
     if not show_video and not show_overlay:
         frame = np.zeros_like(frame)
 
     if face_landmarks:
-        refined_face_landmarks = refine_landmarks(prev_frame_gray, curr_frame_gray, face_landmarks.landmark, face_history, num_landmarks=468)
+        refined_face_landmarks = refine_landmarks(
+            prev_frame_gray, curr_frame_gray,
+            face_landmarks.landmark, face_history, num_landmarks=468
+        )
         if show_lasers and show_video and not show_overlay:
             frame = create_bitcoin_laser_eyes(landmarks, frame, frame_count, width, height, is_face=True)
 
+        # Draw face mesh if overlay is off
         if not show_overlay:
             for x, y in refined_face_landmarks:
                 cv2.circle(frame, (int(x), int(y)), 1, (255, 255, 0), -1)
@@ -296,44 +401,77 @@ def apply_anime_filter(frame, landmarks, face_landmarks, hand_landmarks_list, fr
                 x2, y2 = map(int, refined_face_landmarks[idx2])
                 cv2.line(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
 
+        # Show a red dot for the gaze, but scaled to the camera feed
         if gaze_point and show_video:
-            # Draw a red dot at the gaze point for feedback.
-            cv2.circle(frame, gaze_point, 10, (0, 0, 255), 2)
-            cv2.putText(frame, "Gaze", (gaze_point[0] + 15, gaze_point[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            # gaze_point is in full display coords; scale it down to 640x480
+            dot_x = int((gaze_point[0] / display_w) * width)
+            dot_y = int((gaze_point[1] / display_h) * height)
+            cv2.circle(frame, (dot_x, dot_y), 10, (0, 0, 255), 2)
+            cv2.putText(frame, "Gaze", (dot_x + 15, dot_y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
+        # If overlay is on, show the axes & eye lines
         if show_overlay and landmarks is not None:
             nose_tip = (int(landmarks[1].x * width), int(landmarks[1].y * height))
             focal_length = width
-            camera_matrix = np.array([[focal_length, 0, width/2], [0, focal_length, height/2], [0, 0, 1]], dtype="double")
+            camera_matrix = np.array([
+                [focal_length, 0, width/2],
+                [0, focal_length, height/2],
+                [0, 0, 1]
+            ], dtype="double")
 
             axis_length = 100
-            axis_points = np.float32([[axis_length, 0, 0], [0, axis_length, 0], [0, 0, axis_length]]).reshape(-1, 3)
-            axis_points_2d, _ = cv2.projectPoints(axis_points, cv2.Rodrigues(rmat)[0], np.zeros((3, 1)), camera_matrix, np.zeros((4, 1)))
+            axis_points = np.float32([
+                [axis_length, 0, 0],
+                [0, axis_length, 0],
+                [0, 0, axis_length]
+            ]).reshape(-1, 3)
+            axis_points_2d, _ = cv2.projectPoints(
+                axis_points,
+                cv2.Rodrigues(rmat)[0],
+                np.zeros((3, 1)),
+                camera_matrix,
+                np.zeros((4, 1))
+            )
             axis_points_2d = axis_points_2d.reshape(-1, 2).astype(int)
 
             cv2.line(frame, nose_tip, tuple(axis_points_2d[0]), (0, 0, 255), 2)  # X-axis (roll)
             cv2.line(frame, nose_tip, tuple(axis_points_2d[1]), (0, 255, 0), 2)  # Y-axis (pitch)
             cv2.line(frame, nose_tip, tuple(axis_points_2d[2]), (255, 0, 0), 2)  # Z-axis (yaw)
 
-            left_eye_center = (int(np.mean([landmarks[i].x * width for i in [33, 133]])),
-                               int(np.mean([landmarks[i].y * height for i in [33, 133]])))
-            right_eye_center = (int(np.mean([landmarks[i].x * width for i in [263, 362]])),
-                                int(np.mean([landmarks[i].y * height for i in [263, 362]])))
+            left_eye_center = (
+                int(np.mean([landmarks[i].x * width for i in [33, 133]])),
+                int(np.mean([landmarks[i].y * height for i in [33, 133]]))
+            )
+            right_eye_center = (
+                int(np.mean([landmarks[i].x * width for i in [263, 362]])),
+                int(np.mean([landmarks[i].y * height for i in [263, 362]]))
+            )
             eye_length = 150
-            left_eye_end = (int(left_eye_center[0] + eye_length * math.sin(math.radians(eye_yaw))),
-                            int(left_eye_center[1] - eye_length * math.sin(math.radians(eye_pitch))))
-            right_eye_end = (int(right_eye_center[0] + eye_length * math.sin(math.radians(eye_yaw))),
-                             int(right_eye_center[1] - eye_length * math.sin(math.radians(eye_pitch))))
+            left_eye_end = (
+                int(left_eye_center[0] + eye_length * math.sin(math.radians(eye_yaw))),
+                int(left_eye_center[1] - eye_length * math.sin(math.radians(eye_pitch)))
+            )
+            right_eye_end = (
+                int(right_eye_center[0] + eye_length * math.sin(math.radians(eye_yaw))),
+                int(right_eye_center[1] - eye_length * math.sin(math.radians(eye_pitch)))
+            )
             cv2.line(frame, left_eye_center, left_eye_end, (255, 255, 0), 2)
             cv2.line(frame, right_eye_center, right_eye_end, (255, 255, 0), 2)
 
+    # Draw hand landmarks
     if not show_overlay:
         for idx, hand_landmarks in enumerate(hand_landmarks_list):
             if idx >= len(hand_histories):
                 hand_histories.append(deque())
-            refined_hand_landmarks = refine_landmarks(prev_frame_gray, curr_frame_gray, hand_landmarks.landmark, hand_histories[idx], num_landmarks=21)
+            refined_hand_landmarks = refine_landmarks(
+                prev_frame_gray, curr_frame_gray,
+                hand_landmarks.landmark, hand_histories[idx], num_landmarks=21
+            )
             if show_lasers and show_video:
-                frame = create_bitcoin_laser_eyes(hand_landmarks.landmark, frame, frame_count, width, height, is_face=False)
+                frame = create_bitcoin_laser_eyes(
+                    hand_landmarks.landmark, frame, frame_count, width, height, is_face=False
+                )
 
             for x, y in refined_hand_landmarks:
                 cv2.circle(frame, (int(x), int(y)), 1, (255, 255, 0), -1)
@@ -343,15 +481,22 @@ def apply_anime_filter(frame, landmarks, face_landmarks, hand_landmarks_list, fr
                 x2, y2 = map(int, refined_hand_landmarks[idx2])
                 cv2.line(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
 
+    # Show debug text
     if distance_cm is not None:
-        cv2.putText(frame, f"Distance: {distance_cm:.1f} cm", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Distance: {distance_cm:.1f} cm", (10, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     if pitch is not None and yaw is not None and roll is not None:
-        cv2.putText(frame, f"Head Pitch: {pitch:.1f} deg", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"Head Yaw: {yaw:.1f} deg", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"Head Roll: {roll:.1f} deg", (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Head Pitch: {pitch:.1f} deg", (10, 180),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Head Yaw: {yaw:.1f} deg", (10, 210),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Head Roll: {roll:.1f} deg", (10, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     if eye_yaw is not None and eye_pitch is not None:
-        cv2.putText(frame, f"Eye Yaw: {eye_yaw:.1f} deg", (10, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"Eye Pitch: {eye_pitch:.1f} deg", (10, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Eye Yaw: {eye_yaw:.1f} deg", (10, 270),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Eye Pitch: {eye_pitch:.1f} deg", (10, 300),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
     return frame
 
@@ -374,7 +519,10 @@ def apply_mask():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     width, height = 640, 480
     focal_length = width
+
+    # We'll use these for the full-screen gaze mapping:
     display_width, display_height = get_display_size()
+    print(f"Display size: {display_width}x{display_height}")
 
     mirror_mode = True
     show_lasers = True
@@ -389,7 +537,11 @@ def apply_mask():
     angle_history = deque(maxlen=10)
     quat_history = deque(maxlen=10)
     gaze_history = deque(maxlen=5)
-    camera_matrix = np.array([[focal_length, 0, width/2], [0, focal_length, height/2], [0, 0, 1]], dtype="double")
+    camera_matrix = np.array([
+        [focal_length, 0, width/2],
+        [0, focal_length, height/2],
+        [0, 0, 1]
+    ], dtype="double")
     dist_coeffs = np.zeros((4, 1))
 
     # Calibration offsets (default: not calibrated)
@@ -397,13 +549,11 @@ def apply_mask():
     pitch_offset = None
     gaze_offset = None
 
-    # Calibration wizard variables
+    # For the "stare at camera" calibration steps
     calibration_mode = False
     calibration_step_index = 0
     calibration_timer_start = 0
-    # Store calibration values in a dict for easy updating
     calibration_values = {"initial_offset": None, "gaze_offset": None, "pitch_offset": None}
-    # Define calibration steps with instructions and durations (in seconds)
     calibration_steps = [
         {
             "phase": "Head Calibration",
@@ -415,7 +565,14 @@ def apply_mask():
             "phase": "Gaze Calibration",
             "instruction": "FIX your GAZE on the RED dot at the center of the screen.",
             "duration": 3.0,
-            "action": lambda pitch, yaw, roll, gaze_pt, eye_pitch: calibration_values.update({"gaze_offset": [gaze_pt[0] - width/2, gaze_pt[1] - height/2]})
+            # We'll store an offset in "camera coords"—but keep in mind we might
+            # also want to unify this with a multi-point offset in a bigger calibration wizard.
+            "action": lambda pitch, yaw, roll, gaze_pt, eye_pitch: calibration_values.update({
+                "gaze_offset": [
+                    gaze_pt[0] - (display_width / 2),
+                    gaze_pt[1] - (display_height / 2)
+                ]
+            })
         },
         {
             "phase": "Eye Pitch Calibration",
@@ -450,28 +607,48 @@ def apply_mask():
 
         distance_cm = None
         pitch, yaw, roll, rmat, tvec = None, None, None, None, None
-        gaze_point = None
+        screen_gaze_point = None
         eye_yaw, eye_pitch = None, None
         landmarks = None
+
         if face_landmarks:
             landmarks = face_landmarks.landmark
             distance_cm = calculate_distance(landmarks, width, height, focal_length)
-            pitch, yaw, roll, rmat, tvec = get_head_orientation(landmarks, width, height, camera_matrix, dist_coeffs, angle_history, quat_history, initial_offset)
-            (gaze_point, eye_yaw, eye_pitch) = calculate_gaze_projection(landmarks, width, height, distance_cm, pitch, yaw, rmat, tvec, gaze_history, mirror_mode, pitch_offset, gaze_offset)
+            pitch, yaw, roll, rmat, tvec = get_head_orientation(
+                landmarks, width, height, camera_matrix, dist_coeffs, angle_history, quat_history, initial_offset
+            )
+            # Now we compute the gaze in full display coords:
+            (screen_gaze_point, eye_yaw, eye_pitch) = calculate_gaze_projection(
+                landmarks,
+                width, height,
+                distance_cm,
+                pitch, yaw,
+                rmat, tvec,
+                gaze_history,
+                mirror_mode,
+                pitch_offset,
+                gaze_offset,
+                display_w=display_width,
+                display_h=display_height
+            )
 
-        # --- Calibration Wizard Mode ---
+        # Simple 3-step calibration wizard
         if calibration_mode:
             if face_landmarks:
                 current_step = calibration_steps[calibration_step_index]
                 current_time = time.time()
                 time_elapsed = current_time - calibration_timer_start
                 time_left = current_step["duration"] - time_elapsed
-                # Overlay the calibration wizard instructions (includes RED dot for gaze calibration)
-                frame = calibration_wizard(frame, current_step["phase"], current_step["instruction"], time_left, current_step["duration"])
+                frame = calibration_wizard(
+                    frame,
+                    current_step["phase"],
+                    current_step["instruction"],
+                    time_left,
+                    current_step["duration"]
+                )
                 if time_left <= 0:
-                    # Capture calibration values using current measurements
-                    if pitch is not None and yaw is not None and roll is not None and gaze_point is not None and eye_pitch is not None:
-                        current_step["action"](pitch, yaw, roll, gaze_point, eye_pitch)
+                    if pitch is not None and yaw is not None and roll is not None and screen_gaze_point is not None and eye_pitch is not None:
+                        current_step["action"](pitch, yaw, roll, screen_gaze_point, eye_pitch)
                         print(f"{current_step['phase']} done. Values captured.")
                     else:
                         print("No valid face data for calibration. Try again.")
@@ -486,11 +663,33 @@ def apply_mask():
                     else:
                         calibration_timer_start = time.time()
             else:
-                cv2.putText(frame, "No face detected. Align your face in the frame.", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.putText(frame, "No face detected. Align your face in the frame.",
+                            (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-        # --- End Calibration Wizard Mode ---
-
-        frame = apply_anime_filter(frame, landmarks, face_landmarks, hand_landmarks_list, frame_count, prev_frame_gray, curr_frame_gray, face_history, hand_histories, show_lasers, show_video, show_overlay, distance_cm, pitch, yaw, roll, rmat, gaze_point, eye_yaw, eye_pitch)
+        frame = apply_anime_filter(
+            frame,
+            landmarks,
+            face_landmarks,
+            hand_landmarks_list,
+            frame_count,
+            prev_frame_gray,
+            curr_frame_gray,
+            face_history,
+            hand_histories,
+            show_lasers,
+            show_video,
+            show_overlay,
+            distance_cm,
+            pitch,
+            yaw,
+            roll,
+            rmat,
+            gaze_point=screen_gaze_point,  # pass the full-screen coords
+            eye_yaw=eye_yaw,
+            eye_pitch=eye_pitch,
+            display_w=display_width,
+            display_h=display_height
+        )
 
         prev_frame_gray = curr_frame_gray.copy()
 
@@ -501,13 +700,15 @@ def apply_mask():
         calib_text = "Calibrated" if initial_offset is not None else "Not Calibrated"
         pitch_calib_text = "Pitch Calibrated" if pitch_offset is not None else "Pitch Not Calibrated"
         gaze_calib_text = "Gaze Calibrated" if gaze_offset is not None else "Gaze Not Calibrated"
-        cv2.putText(frame, mirror_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, laser_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, video_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, overlay_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, calib_text, (10, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        cv2.putText(frame, mirror_text, (10, 30),  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, laser_text, (10, 60),   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, video_text, (10, 90),   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, overlay_text, (10, 120),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, calib_text, (10, 330),  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, pitch_calib_text, (10, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, gaze_calib_text, (10, 390), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, gaze_calib_text, (10, 390),  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
         instructions = "Press 'm' (mirror) | 'l' (lasers) | 'v' (video) | 'a' (overlay) | 'c' (calibration wizard) | 'q' (quit)"
         cv2.putText(frame, instructions, (10, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
@@ -529,14 +730,12 @@ def apply_mask():
             show_overlay = not show_overlay
             print(f"Overlay: {'ON' if show_overlay else 'OFF'}")
         elif key == ord('c'):
-            # Start the unified calibration wizard if not already in calibration mode
             if not calibration_mode:
                 calibration_mode = True
                 calibration_step_index = 0
                 calibration_timer_start = time.time()
                 calibration_values = {"initial_offset": None, "gaze_offset": None, "pitch_offset": None}
                 print("Entering Calibration Wizard Mode. Follow the on-screen instructions.")
-        # When calibration_mode is active, ignore individual calibration key presses
 
     cap.release()
     cv2.destroyAllWindows()
