@@ -6,8 +6,13 @@ from collections import deque
 import time
 import screeninfo
 from scipy.spatial.transform import Rotation
+import threading
+import socket
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d import Axes3D
 
-# Initialize MediaPipe Face Mesh and Hand Landmarker
+# Initialize MediaPipe
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     max_num_faces=1,
@@ -23,22 +28,337 @@ hands = mp_hands.Hands(
 )
 mp_drawing = mp.solutions.drawing_utils
 
-# Average human inter-eye distance in mm
+# Constants
 AVG_EYE_DISTANCE_MM = 63
+SCREEN_WIDTH = 34.0  # cm (typical 15.6" laptop screen width)
+SCREEN_HEIGHT = 19.0  # cm (typical 15.6" laptop screen height)
+
+# Shared variables
+running = True
+
+# Matplotlib Visualization Class (from your provided code)
+class GazeVisualization:
+    def __init__(self):
+        # Setup figure and 3D axis
+        self.fig = plt.figure(figsize=(12, 8))
+        self.ax = self.fig.add_subplot(111, projection='3d')
+
+        # Initialize data
+        self.head_position = np.array([0, 0, 60])  # Default head position (cm)
+        self.gaze_vector = np.array([0, 0, -1])  # Looking straight ahead
+        self.screen_width, self.screen_height = SCREEN_WIDTH, SCREEN_HEIGHT
+        self.screen_distance = 60  # cm
+
+        # Initialize visualization elements
+        self._setup_visualization()
+
+        # Setup UDP server for receiving data
+        self.server_thread = threading.Thread(target=self._udp_server)
+        self.server_thread.daemon = True
+
+    def _setup_visualization(self):
+        """Initialize all plot elements"""
+        # Set labels and title
+        self.ax.set_xlabel('X (cm)')
+        self.ax.set_ylabel('Z (cm)')
+        self.ax.set_zlabel('Y (cm)')
+        self.ax.set_title('3D Gaze Tracking Visualization')
+
+        # Set initial view limits
+        self.ax.set_xlim([-40, 40])
+        self.ax.set_ylim([0, 100])
+        self.ax.set_zlim([-30, 30])
+
+        # Create laptop model
+        self.laptop_body = self._create_laptop_body()
+        self.laptop_screen = self._create_laptop_screen()
+
+        # Create head model
+        self.head = self._create_head()
+
+        # Create gaze line
+        gaze_xs = [self.head_position[0], self.head_position[0] + self.gaze_vector[0] * 100]
+        gaze_ys = [self.head_position[2], self.head_position[2] + self.gaze_vector[2] * 100]
+        gaze_zs = [self.head_position[1], self.head_position[1] + self.gaze_vector[1] * 100]
+        self.gaze_line, = self.ax.plot(gaze_xs, gaze_ys, gaze_zs, 'r-', linewidth=2, label='Gaze')
+
+        # Create gaze intersection point
+        self.gaze_point, = self.ax.plot([], [], [], 'ro', markersize=8)
+
+        # Add text displays
+        self.distance_text = self.ax.text2D(0.02, 0.95, f"Distance: {self.screen_distance:.1f} cm",
+                                          transform=self.ax.transAxes)
+        self.gaze_text = self.ax.text2D(0.02, 0.90, "Gaze: ", transform=self.ax.transAxes)
+
+        # Set an optimal viewing angle
+        self.ax.view_init(elev=20, azim=-60)
+
+        # Add legend
+        self.ax.legend()
+
+    def _create_laptop_body(self):
+        """Create the laptop base visualization"""
+        width, height = 30, 20  # cm
+        depth = 1.5  # cm
+
+        # Position the laptop on a virtual desk
+        x = 0  # Centered at origin
+        y = 0  # At eye level
+        z = 20  # Distance from origin
+
+        # Define the vertices of the laptop base
+        v = np.array([
+            [x-width/2, y, z],          # Front left
+            [x+width/2, y, z],          # Front right
+            [x+width/2, y, z+depth],    # Back right
+            [x-width/2, y, z+depth],    # Back left
+            [x-width/2, y+height, z],   # Front left top (for reference, not visible)
+        ])
+
+        # Draw the laptop base as a rectangle
+        laptop_body = self.ax.plot_surface(
+            np.array([[v[0,0], v[1,0]], [v[3,0], v[2,0]]]),
+            np.array([[v[0,1], v[1,1]], [v[3,1], v[2,1]]]),
+            np.array([[v[0,2], v[1,2]], [v[3,2], v[2,2]]]),
+            color='gray', alpha=0.7
+        )
+
+        return laptop_body
+
+    def _create_laptop_screen(self):
+        """Create the laptop screen visualization"""
+        width, height = self.screen_width, self.screen_height  # cm
+
+        # Screen position (slightly above laptop base)
+        x = 0  # Centered
+        base_height = 1  # cm
+        y = base_height + height/2  # Centered vertically
+        z = 20  # Same as laptop base
+
+        # Screen tilt angle (degrees)
+        tilt_angle = 75  # Typical laptop screen angle
+
+        # Calculate screen corners with tilt
+        rad_angle = math.radians(tilt_angle)
+        z_offset = height/2 * math.cos(rad_angle)
+        y_offset = height/2 * math.sin(rad_angle)
+
+        # Define screen vertices
+        corners = np.array([
+            [x-width/2, y-y_offset, z-z_offset],  # Bottom left
+            [x+width/2, y-y_offset, z-z_offset],  # Bottom right
+            [x+width/2, y+y_offset, z+z_offset],  # Top right
+            [x-width/2, y+y_offset, z+z_offset],  # Top left
+            [x-width/2, y-y_offset, z-z_offset]   # Back to bottom left to close the shape
+        ])
+
+        # Draw screen outline
+        screen = self.ax.plot(corners[:,0], corners[:,2], corners[:,1], 'b-', linewidth=2)
+
+        # Draw screen surface
+        x_grid = np.array([[corners[0,0], corners[1,0]], [corners[3,0], corners[2,0]]])
+        y_grid = np.array([[corners[0,1], corners[1,1]], [corners[3,1], corners[2,1]]])
+        z_grid = np.array([[corners[0,2], corners[1,2]], [corners[3,2], corners[2,2]]])
+
+        screen_surface = self.ax.plot_surface(x_grid, z_grid, y_grid, color='blue', alpha=0.3)
+
+        # Store screen parameters for intersection calculations
+        self.screen_corners = corners
+        self.screen_normal = np.array([0, math.sin(rad_angle), math.cos(rad_angle)])
+        self.screen_center = np.array([x, y, z])
+
+        return screen_surface
+
+    def _create_head(self):
+        """Create a simple head visualization"""
+        # Head dimensions
+        head_radius = 10  # cm
+
+        # Create a sphere for the head
+        u = np.linspace(0, 2 * np.pi, 20)
+        v = np.linspace(0, np.pi, 20)
+        x = self.head_position[0] + head_radius * np.outer(np.cos(u), np.sin(v))
+        y = self.head_position[1] + head_radius * np.outer(np.sin(u), np.sin(v))
+        z = self.head_position[2] + head_radius * np.outer(np.ones(np.size(u)), np.cos(v))
+
+        head = self.ax.plot_surface(x, z, y, color='tan', alpha=0.7)
+
+        # Add eyes (simplified as points)
+        eye_offset = 3  # cm
+        left_eye = self.head_position + np.array([-eye_offset, 0, 0])
+        right_eye = self.head_position + np.array([eye_offset, 0, 0])
+
+        self.left_eye, = self.ax.plot([left_eye[0]], [left_eye[2]], [left_eye[1]], 'ko', markersize=5)
+        self.right_eye, = self.ax.plot([right_eye[0]], [right_eye[2]], [right_eye[1]], 'ko', markersize=5)
+
+        return head
+
+    def _calculate_gaze_screen_intersection(self):
+        """Calculate where the gaze ray intersects with the laptop screen"""
+        corners = self.screen_corners[:4]
+
+        v1 = corners[1] - corners[0]  # Bottom edge
+        v2 = corners[3] - corners[0]  # Left edge
+
+        normal = np.cross(v1, v2)
+        normal = normal / np.linalg.norm(normal)
+
+        ray_origin = self.head_position
+        ray_direction = self.gaze_vector
+
+        ndotu = np.dot(normal, ray_direction)
+        if abs(ndotu) < 1e-6:
+            return None
+
+        w = ray_origin - corners[0]
+        t = -np.dot(normal, w) / ndotu
+
+        if t < 0:
+            return None
+
+        intersection = ray_origin + t * ray_direction
+
+        origin = corners[0]
+        basis1 = v1 / np.linalg.norm(v1)
+        basis2 = v2 / np.linalg.norm(v2)
+
+        screen_vector = intersection - origin
+        u = np.dot(screen_vector, basis1)
+        v = np.dot(screen_vector, basis2)
+
+        if (0 <= u <= np.linalg.norm(v1)) and (0 <= v <= np.linalg.norm(v2)):
+            return intersection
+
+        return None
+
+    def update(self, head_position=None, gaze_vector=None, screen_info=None):
+        """Update the visualization with new data"""
+        if head_position is not None:
+            self.head_position = np.array(head_position) / 10.0  # Convert mm to cm
+
+        if gaze_vector is not None:
+            self.gaze_vector = np.array(gaze_vector)
+            if np.linalg.norm(self.gaze_vector) > 0:
+                self.gaze_vector = self.gaze_vector / np.linalg.norm(self.gaze_vector)
+
+        if screen_info is not None:
+            if 'width' in screen_info and 'height' in screen_info:
+                self.screen_width = screen_info['width'] / 10.0
+                self.screen_height = screen_info['height'] / 10.0
+            if 'distance' in screen_info:
+                self.screen_distance = screen_info['distance'] / 10.0
+
+        self._update_head()
+        self._update_gaze()
+        self._update_screen()
+        self._update_text()
+
+    def _update_head(self):
+        """Update head position and orientation"""
+        eye_offset = 3  # cm
+        left_eye_pos = self.head_position + np.array([-eye_offset, 0, 0])
+        right_eye_pos = self.head_position + np.array([eye_offset, 0, 0])
+
+        self.left_eye.set_data([left_eye_pos[0]], [left_eye_pos[2]])
+        self.left_eye.set_3d_properties([left_eye_pos[1]])
+        self.right_eye.set_data([right_eye_pos[0]], [right_eye_pos[2]])
+        self.right_eye.set_3d_properties([right_eye_pos[1]])
+
+    def _update_gaze(self):
+        """Update gaze line and intersection point"""
+        gaze_length = 100  # cm
+        gaze_end = self.head_position + self.gaze_vector * gaze_length
+
+        self.gaze_line.set_data([self.head_position[0], gaze_end[0]],
+                               [self.head_position[2], gaze_end[2]])
+        self.gaze_line.set_3d_properties([self.head_position[1], gaze_end[1]])
+
+        intersection = self._calculate_gaze_screen_intersection()
+        if intersection is not None:
+            self.gaze_point.set_data([intersection[0]], [intersection[2]])
+            self.gaze_point.set_3d_properties([intersection[1]])
+
+            corners = self.screen_corners[:4]
+            origin = corners[0]
+            width_vec = corners[1] - corners[0]
+            height_vec = corners[3] - corners[0]
+
+            screen_vector = intersection - origin
+            u = np.dot(screen_vector, width_vec) / np.dot(width_vec, width_vec)
+            v = np.dot(screen_vector, height_vec) / np.dot(height_vec, height_vec)
+
+            self.gaze_text.set_text(f"Gaze: ({u*100:.1f}%, {v*100:.1f}%)")
+        else:
+            self.gaze_point.set_data([], [])
+            self.gaze_point.set_3d_properties([])
+            self.gaze_text.set_text("Gaze: Not on screen")
+
+    def _update_screen(self):
+        """Update screen model if dimensions change"""
+        if hasattr(self, 'laptop_screen') and self.laptop_screen is not None:
+            try:
+                self.laptop_screen.remove()
+            except:
+                pass
+        self.laptop_screen = self._create_laptop_screen()
+
+    def _update_text(self):
+        """Update text displays"""
+        self.distance_text.set_text(f"Distance: {np.linalg.norm(self.head_position):.1f} cm")
+
+    def _udp_server(self):
+        """UDP server to receive data from the gaze tracking process"""
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server_socket.bind(('127.0.0.1', 5555))
+        server_socket.settimeout(0.1)
+
+        print("UDP server listening on 127.0.0.1:5555")
+
+        while True:
+            try:
+                data, addr = server_socket.recvfrom(1024)
+                try:
+                    values = [float(x) for x in data.decode().split(',')]
+                    head_position = values[0:3]
+                    gaze_vector = values[3:6]
+                    screen_info = {
+                        'width': values[6],
+                        'height': values[7],
+                        'distance': values[8]
+                    }
+                    self.update(head_position, gaze_vector, screen_info)
+                except Exception as e:
+                    print(f"Error processing data: {e}")
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"UDP server error: {e}")
+                time.sleep(1)
+
+    def animate(self, i):
+        """Animation function for matplotlib"""
+        return (self.gaze_line, self.gaze_point, self.left_eye, self.right_eye,
+                self.distance_text, self.gaze_text)
+
+    def start(self):
+        """Start the visualization"""
+        self.server_thread.start()
+        anim = FuncAnimation(self.fig, self.animate, interval=100, blit=True)
+        plt.show()
 
 def get_display_size():
     try:
         screen = screeninfo.get_monitors()[0]
         return screen.width, screen.height
-    except Exception as e:
-        return 640, 480
+    except Exception:
+        return 1920, 1080
 
 def calculate_distance(landmarks, width, height, focal_length):
     left_eye = np.array([landmarks[33].x * width, landmarks[33].y * height])
     right_eye = np.array([landmarks[263].x * width, landmarks[263].y * height])
     pixel_distance = np.linalg.norm(left_eye - right_eye)
     distance_mm = (AVG_EYE_DISTANCE_MM * focal_length) / pixel_distance
-    return distance_mm / 10  # Convert to cm
+    return distance_mm / 10
 
 def slerp_quat(q1, q2, t):
     dot = np.dot(q1, q2)
@@ -56,14 +376,13 @@ def slerp_quat(q1, q2, t):
     s1 = sin_theta / sin_theta_0
     return (s0 * q1) + (s1 * q2)
 
-def get_head_orientation(landmarks, width, height, camera_matrix, dist_coeffs, angle_history, quat_history, initial_offset=None):
+def get_head_orientation(
+    landmarks, width, height, camera_matrix, dist_coeffs,
+    angle_history, quat_history, initial_offset=None
+):
     model_points = np.array([
-        (0.0, 0.0, 0.0),         # Nose tip
-        (-225.0, 170.0, -135.0), # Left eye corner
-        (225.0, 170.0, -135.0),  # Right eye corner
-        (0.0, -330.0, -65.0),    # Chin
-        (-150.0, -150.0, -125.0),# Left mouth corner
-        (150.0, -150.0, -125.0)  # Right mouth corner
+        (0.0, 0.0, 0.0), (-225.0, 170.0, -135.0), (225.0, 170.0, -135.0),
+        (0.0, -330.0, -65.0), (-150.0, -150.0, -125.0), (150.0, -150.0, -125.0)
     ], dtype="double")
     image_points = np.array([
         (landmarks[1].x * width, landmarks[1].y * height),
@@ -74,22 +393,19 @@ def get_head_orientation(landmarks, width, height, camera_matrix, dist_coeffs, a
         (landmarks[291].x * width, landmarks[291].y * height)
     ], dtype="double")
 
-    success, rvec, tvec = cv2.solvePnP(
-        model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
-    )
+    success, rvec, tvec = cv2.solvePnP(model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
     if success:
         rmat, _ = cv2.Rodrigues(rvec)
-        sy = math.sqrt(rmat[0, 0]*rmat[0, 0] + rmat[1, 0]*rmat[1, 0])
+        sy = math.sqrt(rmat[0,0]**2 + rmat[1,0]**2)
         singular = sy < 1e-6
         if not singular:
-            pitch = math.degrees(math.atan2(rmat[2, 1], rmat[2, 2]))
-            yaw = math.degrees(math.atan2(-rmat[2, 0], sy))
-            roll = math.degrees(math.atan2(rmat[1, 0], rmat[0, 0]))
+            pitch = math.degrees(math.atan2(rmat[2,1], rmat[2,2]))
+            yaw = math.degrees(math.atan2(-rmat[2,0], sy))
+            roll = math.degrees(math.atan2(rmat[1,0], rmat[0,0]))
         else:
-            pitch = math.degrees(math.atan2(-rmat[1, 2], rmat[1, 1]))
-            yaw = math.degrees(math.atan2(-rmat[2, 0], sy))
+            pitch = math.degrees(math.atan2(-rmat[1,2], rmat[1,1]))
+            yaw = math.degrees(math.atan2(-rmat[2,0], sy))
             roll = 0
-
         angle_history.append([pitch, yaw, roll])
         if len(angle_history) > 10:
             angle_history.popleft()
@@ -109,70 +425,41 @@ def get_head_orientation(landmarks, width, height, camera_matrix, dist_coeffs, a
         for i in range(1, len(quat_history)):
             smoothed_quat = slerp_quat(smoothed_quat, quat_history[i], 1.0 / (i + 1))
         smoothed_rmat = Rotation.from_quat(smoothed_quat).as_matrix()
-
         return pitch, yaw, roll, smoothed_rmat, tvec
-    return 0.0, 0.0, 0.0, np.eye(3), np.zeros((3, 1))
+    return 0.0, 0.0, 0.0, np.eye(3), np.zeros((3,1))
 
 def calculate_gaze_projection(
-    landmarks,
-    width, height,
-    distance_cm,
-    head_pitch, head_yaw, head_rmat, head_tvec,
-    gaze_history,
-    mirror_mode=True,
-    pitch_offset=None,
-    gaze_offset=None,
-    display_w=1920,  # fallback
-    display_h=1080   # fallback
+    landmarks, width, height, distance_cm, head_pitch, head_yaw, head_rmat, head_tvec,
+    gaze_history, mirror_mode=True, pitch_offset=None, gaze_offset=None,
+    display_w=1920, display_h=1080
 ):
-    """
-    Returns:
-      (screen_x, screen_y) in full display coords,
-      plus eye_yaw, eye_pitch for debugging.
-    """
+    focal_length = width
+    camera_matrix = np.array([[focal_length, 0, width/2], [0, focal_length, height/2], [0, 0, 1]])
 
-    # Compute eye centers on the 640x480 camera feed
-    left_eye_center = np.mean([
-        (landmarks[33].x * width,  landmarks[33].y * height),
-        (landmarks[133].x * width, landmarks[133].y * height)
-    ], axis=0)
-    right_eye_center = np.mean([
-        (landmarks[263].x * width, landmarks[263].y * height),
-        (landmarks[362].x * width, landmarks[362].y * height)
-    ], axis=0)
+    left_eye_center = np.mean([(landmarks[33].x * width, landmarks[33].y * height),
+                               (landmarks[133].x * width, landmarks[133].y * height)], axis=0)
+    right_eye_center = np.mean([(landmarks[263].x * width, landmarks[263].y * height),
+                                (landmarks[362].x * width, landmarks[362].y * height)], axis=0)
     eye_center_2d = (left_eye_center + right_eye_center) / 2
 
-    # Compute iris centers
-    left_iris_center = np.mean([
-        (landmarks[i].x * width, landmarks[i].y * height)
-        for i in [468, 469, 470, 471]
-    ], axis=0)
-    right_iris_center = np.mean([
-        (landmarks[i].x * width, landmarks[i].y * height)
-        for i in [473, 474, 475, 476]
-    ], axis=0)
+    left_iris_center = np.mean([(landmarks[i].x * width, landmarks[i].y * height) for i in [468, 469, 470, 471]], axis=0)
+    right_iris_center = np.mean([(landmarks[i].x * width, landmarks[i].y * height) for i in [473, 474, 475, 476]], axis=0)
     iris_center_2d = (left_iris_center + right_iris_center) / 2
 
     eye_width = np.linalg.norm(right_eye_center - left_eye_center) / 2
     gaze_vec_2d = iris_center_2d - eye_center_2d
 
-    # Compute gaze angles (in degrees) with sensitivity multipliers
     eye_yaw = math.degrees(math.atan2(gaze_vec_2d[0], eye_width)) * 9
     eye_pitch = math.degrees(math.atan2(gaze_vec_2d[1], eye_width)) * 9
 
     if pitch_offset is not None:
         eye_pitch -= pitch_offset
 
-    # We want to map the angles to the FULL display:
-    # If display is e.g. 1920x1080, we define how many degrees correspond to half the display width/height.
-    gaze_range_x = 15.0  # degrees for half-screen displacement horizontally
-    gaze_range_y = 5.0   # degrees for half-screen displacement vertically
-
-    # Convert angles to display coords
+    gaze_range_x = 15.0
+    gaze_range_y = 5.0
     yaw_scale = (display_w / 2) / gaze_range_x
     pitch_scale = (display_h / 2) / gaze_range_y
 
-    # So the center of the display is at (display_w/2, display_h/2)
     screen_x = (eye_yaw * yaw_scale) + display_w / 2
     screen_y = (eye_pitch * pitch_scale) + display_h / 2
 
@@ -180,11 +467,9 @@ def calculate_gaze_projection(
         screen_x -= gaze_offset[0]
         screen_y -= gaze_offset[1]
 
-    # Let's clamp to the display's boundaries
     screen_x = max(0, min(screen_x, display_w - 1))
     screen_y = max(0, min(screen_y, display_h - 1))
 
-    # Save to the smoothing queue
     gaze_history.append([screen_x, screen_y])
     if len(gaze_history) > 5:
         gaze_history.popleft()
@@ -192,71 +477,42 @@ def calculate_gaze_projection(
     final_x = int(smoothed_gaze[0])
     final_y = int(smoothed_gaze[1])
 
-    print(f"Eye Yaw: {eye_yaw:.1f}, Eye Pitch: {eye_pitch:.1f}, "
-          f"Gaze X: {final_x}, Gaze Y: {final_y} (display coords)")
-
     return (final_x, final_y), eye_yaw, eye_pitch
 
 def create_bitcoin_laser_eyes(landmarks, frame, frame_count, width, height, is_face=True):
     if is_face:
-        model_points = np.array([
-            [-100.0, 50.0, -50.0],
-            [100.0, 50.0, -50.0],
-            [0.0, 0.0, 0.0],
-            [0.0, -150.0, -50.0],
-            [-75.0, -75.0, -50.0],
-            [75.0, -75.0, -50.0]
-        ], dtype="double")
-        image_points = np.array([
-            (landmarks[33].x * width, landmarks[33].y * height),
-            (landmarks[263].x * width, landmarks[263].y * height),
-            (landmarks[1].x * width,  landmarks[1].y * height),
-            (landmarks[152].x * width, landmarks[152].y * height),
-            (landmarks[61].x * width,  landmarks[61].y * height),
-            (landmarks[291].x * width, landmarks[291].y * height)
-        ], dtype="double")
+        model_points = np.array([[-100.0, 50.0, -50.0], [100.0, 50.0, -50.0], [0.0, 0.0, 0.0],
+                                 [0.0, -150.0, -50.0], [-75.0, -75.0, -50.0], [75.0, -75.0, -50.0]], dtype="double")
+        image_points = np.array([(landmarks[33].x * width, landmarks[33].y * height),
+                                 (landmarks[263].x * width, landmarks[263].y * height),
+                                 (landmarks[1].x * width, landmarks[1].y * height),
+                                 (landmarks[152].x * width, landmarks[152].y * height),
+                                 (landmarks[61].x * width, landmarks[61].y * height),
+                                 (landmarks[291].x * width, landmarks[291].y * height)], dtype="double")
         left_eye_indices = [33, 246, 161, 160, 159, 158]
         right_eye_indices = [263, 466, 388, 387, 386, 385]
-        left_center = (
-            int(np.mean([landmarks[i].x * width for i in left_eye_indices])),
-            int(np.mean([landmarks[i].y * height for i in left_eye_indices]))
-        )
-        right_center = (
-            int(np.mean([landmarks[i].x * width for i in right_eye_indices])),
-            int(np.mean([landmarks[i].y * height for i in right_eye_indices]))
-        )
+        left_center = (int(np.mean([landmarks[i].x * width for i in left_eye_indices])),
+                       int(np.mean([landmarks[i].y * height for i in left_eye_indices])))
+        right_center = (int(np.mean([landmarks[i].x * width for i in right_eye_indices])),
+                        int(np.mean([landmarks[i].y * height for i in right_eye_indices])))
     else:
-        model_points = np.array([
-            [0.0, 0.0, 0.0],
-            [50.0, -50.0, -20.0],
-            [50.0, -100.0, -30.0],
-            [-50.0, -50.0, -20.0],
-            [-50.0, -100.0, -30.0],
-            [0.0, -70.0, -10.0]
-        ], dtype="double")
-        image_points = np.array([
-            (landmarks[0].x * width,  landmarks[0].y * height),
-            (landmarks[5].x * width,  landmarks[5].y * height),
-            (landmarks[8].x * width,  landmarks[8].y * height),
-            (landmarks[17].x * width, landmarks[17].y * height),
-            (landmarks[20].x * width, landmarks[20].y * height),
-            (landmarks[9].x * width,  landmarks[9].y * height)
-        ], dtype="double")
+        model_points = np.array([[0.0, 0.0, 0.0], [50.0, -50.0, -20.0], [50.0, -100.0, -30.0],
+                                 [-50.0, -50.0, -20.0], [-50.0, -100.0, -30.0], [0.0, -70.0, -10.0]], dtype="double")
+        image_points = np.array([(landmarks[0].x * width, landmarks[0].y * height),
+                                 (landmarks[5].x * width, landmarks[5].y * height),
+                                 (landmarks[8].x * width, landmarks[8].y * height),
+                                 (landmarks[17].x * width, landmarks[17].y * height),
+                                 (landmarks[20].x * width, landmarks[20].y * height),
+                                 (landmarks[9].x * width, landmarks[9].y * height)], dtype="double")
         left_center = (int(landmarks[8].x * width), int(landmarks[8].y * height))
         right_center = left_center
 
     focal_length = width
     center = (width / 2, height / 2)
-    camera_matrix = np.array([
-        [focal_length, 0, center[0]],
-        [0, focal_length, center[1]],
-        [0, 0, 1]
-    ], dtype="double")
+    camera_matrix = np.array([[focal_length, 0, center[0]], [0, focal_length, center[1]], [0, 0, 1]], dtype="double")
     dist_coeffs = np.zeros((4, 1))
 
-    success, rotation_vector, translation_vector = cv2.solvePnP(
-        model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
-    )
+    success, rotation_vector, translation_vector = cv2.solvePnP(model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
     if not success:
         print(f"Pose estimation failed for {'face' if is_face else 'hand'}")
         return frame
@@ -296,102 +552,58 @@ def create_bitcoin_laser_eyes(landmarks, frame, frame_count, width, height, is_f
     cv2.circle(frame, left_center, 10, laser_color, -1)
     if is_face:
         cv2.circle(frame, right_center, 10, laser_color, -1)
-
     return frame
 
 def refine_landmarks(prev_frame_gray, curr_frame_gray, landmarks, landmark_history, num_landmarks):
-    current_points = np.array([
-        (l.x * curr_frame_gray.shape[1], l.y * curr_frame_gray.shape[0])
-        for l in landmarks
-    ], dtype=np.float32)
+    current_points = np.array([(l.x * curr_frame_gray.shape[1], l.y * curr_frame_gray.shape[0]) for l in landmarks], dtype=np.float32)
     if prev_frame_gray is not None and len(landmark_history) > 0:
         prev_points = np.array(landmark_history[-1], dtype=np.float32).reshape(-1, 1, 2)
         curr_points_flow, status, err = cv2.calcOpticalFlowPyrLK(
             prev_frame_gray, curr_frame_gray, prev_points, None,
-            winSize=(15, 15), maxLevel=2,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
+            winSize=(15, 15), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
         )
         curr_points_flow = curr_points_flow.reshape(-1, 2)
         current_points = 0.9 * current_points + 0.1 * curr_points_flow
-
     landmark_history.append(current_points.tolist())
     if len(landmark_history) > 5:
         landmark_history.popleft()
-
     weights = np.linspace(0.5, 1.0, min(len(landmark_history), 5))
     weights /= weights.sum()
-    smoothed_points = np.average(
-        np.array(landmark_history), axis=0, weights=weights[-len(landmark_history):]
-    )
+    smoothed_points = np.average(np.array(landmark_history), axis=0, weights=weights[-len(landmark_history):])
     return smoothed_points
 
 def calibration_wizard(frame, phase, instruction, timer, total_time):
-    """
-    Draws a semi-transparent overlay with calibration instructions.
-    """
     overlay = frame.copy()
-    alpha = 0.6  # transparency factor
+    alpha = 0.6
     cv2.rectangle(overlay, (0, 0), (frame.shape[1], 80), (50, 50, 50), -1)
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-
     instruction_text = f"{phase}: {instruction}"
     countdown_text = f"Hold steady for: {timer:.1f}s"
-
     cv2.putText(frame, instruction_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
     cv2.putText(frame, countdown_text, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
     progress = int((total_time - timer) / total_time * frame.shape[1])
     cv2.rectangle(frame, (0, 75), (progress, 80), (0, 255, 0), -1)
-
-    # For Gaze Calibration, display a RED dot target at the center.
-    if "Gaze" in phase:
-        target = (frame.shape[1]//2, frame.shape[0]//2)
+    if "Gaze" in phase and "Border" not in phase:
+        target = (frame.shape[1] // 2, frame.shape[0] // 2)
         cv2.circle(frame, target, 8, (0, 0, 255), -1)
-
     return frame
 
 def apply_anime_filter(
-    frame,
-    landmarks,
-    face_landmarks,
-    hand_landmarks_list,
-    frame_count,
-    prev_frame_gray,
-    curr_frame_gray,
-    face_history,
-    hand_histories,
-    show_lasers=True,
-    show_video=True,
-    show_overlay=False,
-    distance_cm=None,
-    pitch=None,
-    yaw=None,
-    roll=None,
-    rmat=None,
-    gaze_point=None,    # <--- This is now (screen_x, screen_y) in full display coords
-    eye_yaw=None,
-    eye_pitch=None,
-    display_w=1920,     # for scaling the dot
-    display_h=1080
+    frame, landmarks, face_landmarks, hand_landmarks_list, frame_count,
+    prev_frame_gray, curr_frame_gray, face_history, hand_histories,
+    show_lasers=True, show_video=True, show_overlay=False,
+    distance_cm=None, pitch=None, yaw=None, roll=None, rmat=None,
+    gaze_point=None, eye_yaw=None, eye_pitch=None, display_w=1920, display_h=1080
 ):
-    """
-    We show the camera feed at 640x480, but 'gaze_point' is in the full display's coordinates.
-    We'll scale it down to the camera feed if we want to see the dot.
-    """
     width, height = frame.shape[1], frame.shape[0]
-
     if not show_video and not show_overlay:
         frame = np.zeros_like(frame)
 
     if face_landmarks:
-        refined_face_landmarks = refine_landmarks(
-            prev_frame_gray, curr_frame_gray,
-            face_landmarks.landmark, face_history, num_landmarks=468
-        )
+        refined_face_landmarks = refine_landmarks(prev_frame_gray, curr_frame_gray, face_landmarks.landmark, face_history, num_landmarks=468)
         if show_lasers and show_video and not show_overlay:
             frame = create_bitcoin_laser_eyes(landmarks, frame, frame_count, width, height, is_face=True)
 
-        # Draw face mesh if overlay is off
         if not show_overlay:
             for x, y in refined_face_landmarks:
                 cv2.circle(frame, (int(x), int(y)), 1, (255, 255, 0), -1)
@@ -401,52 +613,28 @@ def apply_anime_filter(
                 x2, y2 = map(int, refined_face_landmarks[idx2])
                 cv2.line(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
 
-        # Show a red dot for the gaze, but scaled to the camera feed
         if gaze_point and show_video:
-            # gaze_point is in full display coords; scale it down to 640x480
             dot_x = int((gaze_point[0] / display_w) * width)
             dot_y = int((gaze_point[1] / display_h) * height)
             cv2.circle(frame, (dot_x, dot_y), 10, (0, 0, 255), 2)
-            cv2.putText(frame, "Gaze", (dot_x + 15, dot_y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            cv2.putText(frame, f"Gaze", (dot_x + 15, dot_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-        # If overlay is on, show the axes & eye lines
         if show_overlay and landmarks is not None:
             nose_tip = (int(landmarks[1].x * width), int(landmarks[1].y * height))
             focal_length = width
-            camera_matrix = np.array([
-                [focal_length, 0, width/2],
-                [0, focal_length, height/2],
-                [0, 0, 1]
-            ], dtype="double")
-
+            camera_matrix = np.array([[focal_length, 0, width / 2], [0, focal_length, height / 2], [0, 0, 1]], dtype="double")
             axis_length = 100
-            axis_points = np.float32([
-                [axis_length, 0, 0],
-                [0, axis_length, 0],
-                [0, 0, axis_length]
-            ]).reshape(-1, 3)
-            axis_points_2d, _ = cv2.projectPoints(
-                axis_points,
-                cv2.Rodrigues(rmat)[0],
-                np.zeros((3, 1)),
-                camera_matrix,
-                np.zeros((4, 1))
-            )
+            axis_points = np.float32([[axis_length, 0, 0], [0, axis_length, 0], [0, 0, axis_length]]).reshape(-1, 3)
+            axis_points_2d, _ = cv2.projectPoints(axis_points, cv2.Rodrigues(rmat)[0], np.zeros((3, 1)), camera_matrix, np.zeros((4, 1)))
             axis_points_2d = axis_points_2d.reshape(-1, 2).astype(int)
+            cv2.line(frame, nose_tip, tuple(axis_points_2d[0]), (0, 0, 255), 2)
+            cv2.line(frame, nose_tip, tuple(axis_points_2d[1]), (0, 255, 0), 2)
+            cv2.line(frame, nose_tip, tuple(axis_points_2d[2]), (255, 0, 0), 2)
 
-            cv2.line(frame, nose_tip, tuple(axis_points_2d[0]), (0, 0, 255), 2)  # X-axis (roll)
-            cv2.line(frame, nose_tip, tuple(axis_points_2d[1]), (0, 255, 0), 2)  # Y-axis (pitch)
-            cv2.line(frame, nose_tip, tuple(axis_points_2d[2]), (255, 0, 0), 2)  # Z-axis (yaw)
-
-            left_eye_center = (
-                int(np.mean([landmarks[i].x * width for i in [33, 133]])),
-                int(np.mean([landmarks[i].y * height for i in [33, 133]]))
-            )
-            right_eye_center = (
-                int(np.mean([landmarks[i].x * width for i in [263, 362]])),
-                int(np.mean([landmarks[i].y * height for i in [263, 362]]))
-            )
+            left_eye_center = (int(np.mean([landmarks[i].x * width for i in [33, 133]])),
+                               int(np.mean([landmarks[i].y * height for i in [33, 133]])))
+            right_eye_center = (int(np.mean([landmarks[i].x * width for i in [263, 362]])),
+                                int(np.mean([landmarks[i].y * height for i in [263, 362]])))
             eye_length = 150
             left_eye_end = (
                 int(left_eye_center[0] + eye_length * math.sin(math.radians(eye_yaw))),
@@ -459,48 +647,35 @@ def apply_anime_filter(
             cv2.line(frame, left_eye_center, left_eye_end, (255, 255, 0), 2)
             cv2.line(frame, right_eye_center, right_eye_end, (255, 255, 0), 2)
 
-    # Draw hand landmarks
     if not show_overlay:
         for idx, hand_landmarks in enumerate(hand_landmarks_list):
             if idx >= len(hand_histories):
                 hand_histories.append(deque())
-            refined_hand_landmarks = refine_landmarks(
-                prev_frame_gray, curr_frame_gray,
-                hand_landmarks.landmark, hand_histories[idx], num_landmarks=21
-            )
+            refined_hand_landmarks = refine_landmarks(prev_frame_gray, curr_frame_gray, hand_landmarks.landmark, hand_histories[idx], num_landmarks=21)
             if show_lasers and show_video:
-                frame = create_bitcoin_laser_eyes(
-                    hand_landmarks.landmark, frame, frame_count, width, height, is_face=False
-                )
-
+                frame = create_bitcoin_laser_eyes(hand_landmarks.landmark, frame, frame_count, width, height, is_face=False)
             for x, y in refined_hand_landmarks:
                 cv2.circle(frame, (int(x), int(y)), 1, (255, 255, 0), -1)
             for connection in mp_hands.HAND_CONNECTIONS:
                 idx1, idx2 = connection
                 x1, y1 = map(int, refined_hand_landmarks[idx1])
                 x2, y2 = map(int, refined_hand_landmarks[idx2])
-                cv2.line(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
+                cv2.line(frame, (x1, y1), (x2, y2), (255, 255, 0), 1)
 
-    # Show debug text
     if distance_cm is not None:
-        cv2.putText(frame, f"Distance: {distance_cm:.1f} cm", (10, 150),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Distance: {distance_cm:.1f} cm", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     if pitch is not None and yaw is not None and roll is not None:
-        cv2.putText(frame, f"Head Pitch: {pitch:.1f} deg", (10, 180),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"Head Yaw: {yaw:.1f} deg", (10, 210),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"Head Roll: {roll:.1f} deg", (10, 240),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Head Pitch: {pitch:.1f} deg", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Head Yaw: {yaw:.1f} deg", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Head Roll: {roll:.1f} deg", (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     if eye_yaw is not None and eye_pitch is not None:
-        cv2.putText(frame, f"Eye Yaw: {eye_yaw:.1f} deg", (10, 270),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"Eye Pitch: {eye_pitch:.1f} deg", (10, 300),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Eye Yaw: {eye_yaw:.1f} deg", (10, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Eye Pitch: {eye_pitch:.1f} deg", (10, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
     return frame
 
-def apply_mask():
+def run_gaze_tracking():
+    global running
     cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
     if not cap.isOpened():
         print("Failed to open camera at index 1. Retrying...")
@@ -512,15 +687,16 @@ def apply_mask():
                 break
             time.sleep(1)
         if not cap.isOpened():
-            print("Failed to open camera at index 1 after retries. Exiting...")
-            return
+            print("Failed to open camera after retries. Trying index 0...")
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                print("Failed to open any camera. Exiting...")
+                return
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     width, height = 640, 480
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     focal_length = width
-
-    # We'll use these for the full-screen gaze mapping:
     display_width, display_height = get_display_size()
     print(f"Display size: {display_width}x{display_height}")
 
@@ -528,7 +704,7 @@ def apply_mask():
     show_lasers = True
     show_video = True
     show_overlay = False
-    print("Video is mirrored. Press 'm' (mirror), 'l' (lasers), 'v' (video), 'a' (overlay), 'c' (calibration wizard), 'q' (quit).")
+    print("Video is mirrored. Press 'm' (mirror), 'l' (lasers), 'v' (video), 'a' (overlay), 'c' (calibration), 'q' (quit).")
 
     frame_count = 0
     prev_frame_gray = None
@@ -537,19 +713,12 @@ def apply_mask():
     angle_history = deque(maxlen=10)
     quat_history = deque(maxlen=10)
     gaze_history = deque(maxlen=5)
-    camera_matrix = np.array([
-        [focal_length, 0, width/2],
-        [0, focal_length, height/2],
-        [0, 0, 1]
-    ], dtype="double")
+    camera_matrix = np.array([[focal_length, 0, width / 2], [0, focal_length, height / 2], [0, 0, 1]], dtype="double")
     dist_coeffs = np.zeros((4, 1))
 
-    # Calibration offsets (default: not calibrated)
     initial_offset = None
     pitch_offset = None
     gaze_offset = None
-
-    # For the "stare at camera" calibration steps
     calibration_mode = False
     calibration_step_index = 0
     calibration_timer_start = 0
@@ -559,30 +728,36 @@ def apply_mask():
             "phase": "Head Calibration",
             "instruction": "Center your FACE and look straight into the camera.",
             "duration": 3.0,
-            "action": lambda pitch, yaw, roll, gaze_pt, eye_pitch: calibration_values.update({"initial_offset": [pitch, yaw, roll]})
+            "action": lambda p, y, r, gp, ep: calibration_values.update({"initial_offset": [p, y, r]})
         },
         {
             "phase": "Gaze Calibration",
-            "instruction": "FIX your GAZE on the RED dot at the center of the screen.",
+            "instruction": "FIX your GAZE on the RED dot at the center.",
             "duration": 3.0,
-            # We'll store an offset in "camera coords"—but keep in mind we might
-            # also want to unify this with a multi-point offset in a bigger calibration wizard.
-            "action": lambda pitch, yaw, roll, gaze_pt, eye_pitch: calibration_values.update({
-                "gaze_offset": [
-                    gaze_pt[0] - (display_width / 2),
-                    gaze_pt[1] - (display_height / 2)
-                ]
+            "action": lambda p, y, r, gp, ep: calibration_values.update({
+                "gaze_offset": [gp[0] - (display_width / 2), gp[1] - (display_height / 2)]
             })
         },
         {
             "phase": "Eye Pitch Calibration",
             "instruction": "Keep your eyes LEVEL and look straight ahead.",
             "duration": 3.0,
-            "action": lambda pitch, yaw, roll, gaze_pt, eye_pitch: calibration_values.update({"pitch_offset": eye_pitch})
+            "action": lambda p, y, r, gp, ep: calibration_values.update({"pitch_offset": ep})
         }
     ]
 
-    while True:
+    cv2.namedWindow("Bitcoin Laser Eyes with Gaze Tracking", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Bitcoin Laser Eyes with Gaze Tracking", width, height)
+
+    # Start Matplotlib visualization in a separate thread
+    vis = GazeVisualization()
+    vis_thread = threading.Thread(target=vis.start, daemon=True)
+    vis_thread.start()
+
+    # Setup UDP client to send data to the Matplotlib visualization
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    while running:
         ret, frame = cap.read()
         if not ret:
             print("Failed to capture frame. Attempting to reinitialize...")
@@ -601,7 +776,9 @@ def apply_mask():
         curr_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         face_results = face_mesh.process(frame_rgb)
-        face_landmarks = face_results.multi_face_landmarks[0] if face_results.multi_face_landmarks else None
+        face_landmarks = None
+        if face_results.multi_face_landmarks and len(face_results.multi_face_landmarks) > 0:
+            face_landmarks = face_results.multi_face_landmarks[0]
         hand_results = hands.process(frame_rgb)
         hand_landmarks_list = hand_results.multi_hand_landmarks if hand_results.multi_hand_landmarks else []
 
@@ -615,80 +792,70 @@ def apply_mask():
             landmarks = face_landmarks.landmark
             distance_cm = calculate_distance(landmarks, width, height, focal_length)
             pitch, yaw, roll, rmat, tvec = get_head_orientation(
-                landmarks, width, height, camera_matrix, dist_coeffs, angle_history, quat_history, initial_offset
+                landmarks, width, height, camera_matrix, dist_coeffs,
+                angle_history, quat_history, initial_offset
             )
-            # Now we compute the gaze in full display coords:
-            (screen_gaze_point, eye_yaw, eye_pitch) = calculate_gaze_projection(
-                landmarks,
-                width, height,
-                distance_cm,
-                pitch, yaw,
-                rmat, tvec,
-                gaze_history,
-                mirror_mode,
-                pitch_offset,
-                gaze_offset,
-                display_w=display_width,
-                display_h=display_height
+            screen_gaze_point, eye_yaw, eye_pitch = calculate_gaze_projection(
+                landmarks, width, height, distance_cm, pitch, yaw, rmat, tvec,
+                gaze_history, mirror_mode, pitch_offset, gaze_offset,
+                display_w=display_width, display_h=display_height
             )
 
-        # Simple 3-step calibration wizard
+            # Prepare data for Matplotlib visualization
+            head_position = [0, 0, distance_cm * 10]  # Convert cm to mm
+            eye_yaw_rad = math.radians(eye_yaw)
+            eye_pitch_rad = math.radians(eye_pitch)
+            gaze_vector = [
+                math.sin(eye_yaw_rad),
+                math.sin(eye_pitch_rad),
+                -math.cos(eye_yaw_rad) * math.cos(eye_pitch_rad)
+            ]
+            screen_info = {
+                'width': SCREEN_WIDTH * 10,  # Convert cm to mm
+                'height': SCREEN_HEIGHT * 10,
+                'distance': distance_cm * 10
+            }
+
+            # Send data to Matplotlib visualization via UDP
+            data_str = f"{head_position[0]},{head_position[1]},{head_position[2]}," \
+                       f"{gaze_vector[0]},{gaze_vector[1]},{gaze_vector[2]}," \
+                       f"{screen_info['width']},{screen_info['height']},{screen_info['distance']}"
+            udp_socket.sendto(data_str.encode(), ('127.0.0.1', 5555))
+
         if calibration_mode:
-            if face_landmarks:
-                current_step = calibration_steps[calibration_step_index]
-                current_time = time.time()
-                time_elapsed = current_time - calibration_timer_start
-                time_left = current_step["duration"] - time_elapsed
-                frame = calibration_wizard(
-                    frame,
-                    current_step["phase"],
-                    current_step["instruction"],
-                    time_left,
-                    current_step["duration"]
-                )
-                if time_left <= 0:
-                    if pitch is not None and yaw is not None and roll is not None and screen_gaze_point is not None and eye_pitch is not None:
-                        current_step["action"](pitch, yaw, roll, screen_gaze_point, eye_pitch)
-                        print(f"{current_step['phase']} done. Values captured.")
-                    else:
-                        print("No valid face data for calibration. Try again.")
-                    calibration_step_index += 1
-                    if calibration_step_index >= len(calibration_steps):
-                        # Apply calibration values
-                        initial_offset = calibration_values["initial_offset"]
-                        gaze_offset = calibration_values["gaze_offset"]
-                        pitch_offset = calibration_values["pitch_offset"]
-                        calibration_mode = False
-                        print("Calibration COMPLETE! Your settings have been updated.")
-                    else:
-                        calibration_timer_start = time.time()
-            else:
-                cv2.putText(frame, "No face detected. Align your face in the frame.",
-                            (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            current_step = calibration_steps[calibration_step_index]
+            current_time = time.time()
+            time_elapsed = current_time - calibration_timer_start
+            time_left = current_step["duration"] - time_elapsed
+
+            frame = calibration_wizard(
+                frame, current_step["phase"], current_step["instruction"],
+                time_left, current_step["duration"]
+            )
+
+            if time_left <= 0:
+                if face_landmarks and pitch is not None and yaw is not None and roll is not None and screen_gaze_point is not None and eye_pitch is not None:
+                    current_step["action"](pitch, yaw, roll, screen_gaze_point, eye_pitch)
+                    print(f"{current_step['phase']} completed successfully.")
+                else:
+                    print(f"No valid face data for {current_step['phase']}.")
+
+                calibration_step_index += 1
+                if calibration_step_index >= len(calibration_steps):
+                    initial_offset = calibration_values["initial_offset"]
+                    gaze_offset = calibration_values["gaze_offset"]
+                    pitch_offset = calibration_values["pitch_offset"]
+                    calibration_mode = False
+                    print("All calibration steps completed!")
+                else:
+                    calibration_timer_start = time.time()
 
         frame = apply_anime_filter(
-            frame,
-            landmarks,
-            face_landmarks,
-            hand_landmarks_list,
-            frame_count,
-            prev_frame_gray,
-            curr_frame_gray,
-            face_history,
-            hand_histories,
-            show_lasers,
-            show_video,
-            show_overlay,
-            distance_cm,
-            pitch,
-            yaw,
-            roll,
-            rmat,
-            gaze_point=screen_gaze_point,  # pass the full-screen coords
-            eye_yaw=eye_yaw,
-            eye_pitch=eye_pitch,
-            display_w=display_width,
-            display_h=display_height
+            frame, landmarks, face_landmarks, hand_landmarks_list, frame_count,
+            prev_frame_gray, curr_frame_gray, face_history, hand_histories,
+            show_lasers, show_video, show_overlay, distance_cm, pitch, yaw, roll, rmat,
+            gaze_point=screen_gaze_point, eye_yaw=eye_yaw, eye_pitch=eye_pitch,
+            display_w=display_width, display_h=display_height
         )
 
         prev_frame_gray = curr_frame_gray.copy()
@@ -701,21 +868,22 @@ def apply_mask():
         pitch_calib_text = "Pitch Calibrated" if pitch_offset is not None else "Pitch Not Calibrated"
         gaze_calib_text = "Gaze Calibrated" if gaze_offset is not None else "Gaze Not Calibrated"
 
-        cv2.putText(frame, mirror_text, (10, 30),  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, laser_text, (10, 60),   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, video_text, (10, 90),   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, overlay_text, (10, 120),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, calib_text, (10, 330),  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, mirror_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, laser_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, video_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, overlay_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, calib_text, (10, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, pitch_calib_text, (10, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, gaze_calib_text, (10, 390),  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, gaze_calib_text, (10, 390), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        instructions = "Press 'm' (mirror) | 'l' (lasers) | 'v' (video) | 'a' (overlay) | 'c' (calibration wizard) | 'q' (quit)"
+        instructions = "Press 'm' (mirror) | 'l' (lasers) | 'v' (video) | 'a' (overlay) | 'c' (calibration) | 'q' (quit)"
         cv2.putText(frame, instructions, (10, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
         cv2.imshow("Bitcoin Laser Eyes with Gaze Tracking", frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
+            running = False
             break
         elif key == ord('m'):
             mirror_mode = not mirror_mode
@@ -735,15 +903,18 @@ def apply_mask():
                 calibration_step_index = 0
                 calibration_timer_start = time.time()
                 calibration_values = {"initial_offset": None, "gaze_offset": None, "pitch_offset": None}
-                print("Entering Calibration Wizard Mode. Follow the on-screen instructions.")
+                print("Starting calibration wizard. Follow the on-screen instructions.")
 
     cap.release()
     cv2.destroyAllWindows()
     face_mesh.close()
     hands.close()
+    udp_socket.close()
 
 if __name__ == "__main__":
     try:
-        apply_mask()
+        run_gaze_tracking()
     except Exception as e:
         print(f"An error occurred: {e}")
+        import traceback
+        traceback.print_exc()
